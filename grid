@@ -1,0 +1,6 @@
+function setGridKey() {
+  PropertiesService.getScriptProperties().setProperty(
+    'GRID_KEY',
+    'kEHZxAAY67wzmz1Fn2IrlkLVMhwXnu3wesSUX4is'
+  );
+}
