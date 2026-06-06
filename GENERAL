@@ -1,0 +1,1621 @@
+/**
+ * GRID LDP MASTER SUITE - FULL VERSION
+ * Features:
+ * - Robust import from GRID Data Portal / api.grid.gg
+ * - GraphQL + file-download workflow
+ * - Clean modular code in one single file
+ * - Schema-aware JSON access with structured error logging
+ * - Batch writes to Sheets
+ * - Batch import of multiple Series IDs
+ * - General Stats sheet by Series ID
+ * - Gold Diff At 10 sheet by Series ID
+ * - Smart role mapping (Primary Role + Role Chips)
+ * - One unique row per player in derived sheets
+ * - Fix for duplicated / mixed role data in GENERAL vs ROLE
+ *
+ * REQUIRED SCRIPT PROPERTY:
+ * GRID_KEY = your API key
+ */
+
+const CONFIG = {
+  IMPORTER_SHEET: 'Match Importer',
+  DB_SHEET: 'Matches Database',
+  GENERAL_STATS_SHEET: 'General Stats',
+  GOLD_DIFF_SHEET: 'Gold Diff At 10',
+  SETTINGS_SHEET: 'Settings',
+  SCRIM_SHEET: 'Match Recorder',
+  LEADERBOARD_SHEET: 'Leaderboard',
+  LOG_SHEET: 'Logs',
+  ROLE_MAP_SHEET: 'Role Mapping',
+
+  API_BASE_URL: 'https://api.grid.gg',
+  CENTRAL_DATA_GRAPHQL: 'central-data/graphql',
+  SERIES_STATE_GRAPHQL: 'live-data-feed/series-state/graphql',
+
+  SERIES_ID_CELL: 'B3',
+  TOURNAMENT_LOOKUP_CELL: 'B5',
+
+  BATCH_START_ROW: 12,
+  BATCH_SERIES_COL: 2,
+  BATCH_STATUS_COL: 3,
+  BATCH_MESSAGE_COL: 4,
+  BATCH_SIZE: 10,
+
+  MAX_RETRIES: 5,
+  RETRY_DELAY_MS: 1200,
+  WRITE_CHUNK_SIZE: 500,
+  MAX_ERROR_BODY_CHARS: 1000,
+
+  DB_HEADERS: [
+    'Imported At',
+    'Series ID',
+    'Game Sequence',
+    'Platform Game ID',
+    'Tournament ID',
+    'Tournament Name',
+    'Summoner Name',
+    'Team Tag',
+    'Side',
+    'Auto Role',
+    'Champion',
+    'Win',
+    'Game Duration',
+    'Kills',
+    'Deaths',
+    'Assists',
+    'KDA',
+    'Kill Participation',
+    'Team Kills',
+    'Team Deaths',
+    'FirstBloodKill',
+    'FirstBloodAssist',
+    'FirstBloodVictim',
+    'DamagePerMinute',
+    'DamageShare',
+    'WardsPlacedPerMinute',
+    'WardsClearedPerMinute',
+    'ControlWardsPurchased',
+    'CreepScore',
+    'CreepScorePerMinute',
+    'GoldEarned',
+    'GoldEarnedPerMinute',
+    'FirstTurret',
+    'TurretKills',
+    'TurretPlates',
+    'FirstDragon',
+    'DragonKills',
+    'FirstHerald',
+    'RiftHeraldKills',
+    'BaronKills',
+    'InhibitorKills',
+    'Bans',
+    'Gold At 10',
+    'Opp Gold At 10',
+    'Gold Diff At 10'
+  ],
+
+  GENERAL_STATS_HEADERS: [
+    'View',
+    'Role',
+    'Primary Role',
+    'Role Chips',
+    'Summoner Name',
+    'Games',
+    'Wins',
+    'Win Rate',
+    'Avg Kills',
+    'Avg Deaths',
+    'Avg Assists',
+    'Avg KDA',
+    'Avg Kill Participation',
+    'Avg DamagePerMinute',
+    'Avg CreepScorePerMinute'
+  ],
+
+  GOLD_DIFF_HEADERS: [
+    'View',
+    'Role',
+    'Primary Role',
+    'Role Chips',
+    'Summoner Name',
+    'Games',
+    'Avg Gold At 10',
+    'Avg Opp Gold At 10',
+    'Avg Gold Diff At 10'
+  ],
+
+  ROLE_MAP_HEADERS: [
+    'Summoner Name',
+    'Primary Role',
+    'Role Chips',
+    'Role Counts JSON'
+  ],
+
+  LOG_HEADERS: [
+    'Timestamp',
+    'Level',
+    'Code',
+    'Step',
+    'Message',
+    'Context'
+  ],
+
+  SCRIM_HEADERS: [
+    'Date',
+    'Team',
+    'Placement',
+    'Kills',
+    'Notes'
+  ],
+
+  LEADERBOARD_HEADERS: [
+    'Team',
+    'Games',
+    'Wins',
+    'Top 4',
+    'Total Kills',
+    'Placement Points',
+    'Kill Points',
+    'Total Points'
+  ],
+
+  SETTINGS_DEFAULTS: [
+    ['Setting', 'Value'],
+    ['Points per Kill', 1],
+    ['Placement 1', 10],
+    ['Placement 2', 7],
+    ['Placement 3', 5],
+    ['Placement 4', 3],
+    ['Placement 5', 2],
+    ['Placement 6', 1]
+  ]
+};
+
+const ROLE_ALIASES = {
+  TOP: 'TOP',
+  TOPLANE: 'TOP',
+  TOP_LANE: 'TOP',
+  AFK: 'TOP',
+
+  JG: 'JUNGLE',
+  JUNGLE: 'JUNGLE',
+
+  MID: 'MIDDLE',
+  MIDDLE: 'MIDDLE',
+  MIDLANE: 'MIDDLE',
+  MID_LANE: 'MIDDLE',
+
+  ADC: 'BOTTOM',
+  BOT: 'BOTTOM',
+  BOTTOM: 'BOTTOM',
+  DUO_CARRY: 'BOTTOM',
+  BOT_LANE: 'BOTTOM',
+
+  SUPP: 'UTILITY',
+  SUP: 'UTILITY',
+  SUPPORT: 'UTILITY',
+  UTILITY: 'UTILITY',
+  DUO_SUPPORT: 'UTILITY'
+};
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('GRID Master Suite')
+    .addItem('1. Setup Workspace', 'setupGridWorkspace')
+    .addSeparator()
+    .addItem('2. Import GRID Series', 'importGridSeries')
+    .addItem('3. Import Pending Batch', 'importGridSeriesBatch')
+    .addItem('4. Refresh Derived Sheets', 'refreshDerivedSheets_')
+    .addItem('5. Refresh Leaderboard', 'updateLeaderboard')
+    .addSeparator()
+    .addItem('6. Test GRID Connection', 'testGridConnection')
+    .addItem('7. Lookup Recent Series', 'lookupRecentSeries')
+    .addToUi();
+}
+
+function setupGridWorkspace() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    setupImporterSheet_(getOrCreateSheet_(ss, CONFIG.IMPORTER_SHEET));
+    setupTableSheet_(getOrCreateSheet_(ss, CONFIG.DB_SHEET), CONFIG.DB_HEADERS);
+    setupTableSheet_(getOrCreateSheet_(ss, CONFIG.GENERAL_STATS_SHEET), CONFIG.GENERAL_STATS_HEADERS);
+    setupTableSheet_(getOrCreateSheet_(ss, CONFIG.GOLD_DIFF_SHEET), CONFIG.GOLD_DIFF_HEADERS);
+    setupTableSheet_(getOrCreateSheet_(ss, CONFIG.ROLE_MAP_SHEET), CONFIG.ROLE_MAP_HEADERS);
+    setupSettingsSheet_(getOrCreateSheet_(ss, CONFIG.SETTINGS_SHEET));
+    setupTableSheet_(getOrCreateSheet_(ss, CONFIG.SCRIM_SHEET), CONFIG.SCRIM_HEADERS);
+    setupTableSheet_(getOrCreateSheet_(ss, CONFIG.LEADERBOARD_SHEET), CONFIG.LEADERBOARD_HEADERS);
+    setupTableSheet_(getOrCreateSheet_(ss, CONFIG.LOG_SHEET), CONFIG.LOG_HEADERS);
+
+    SpreadsheetApp.getUi().alert('Workspace initialized.');
+  } catch (err) {
+    handleError_(err);
+  }
+}
+
+function importGridSeries() {
+  const lock = LockService.getScriptLock();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  if (!lock.tryLock(5000)) {
+    SpreadsheetApp.getUi().alert('Another import is already running.');
+    return;
+  }
+
+  try {
+    ensureBaseSheets_();
+
+    const apiKey = getApiKey_();
+    const seriesId = getSeriesIdInput_();
+
+    ss.toast(`Importing series ${seriesId}...`, 'GRID Import', 5);
+
+    const seriesInfo = fetchSeriesInfo_(seriesId, apiKey);
+    const games = fetchSeriesGames_(seriesId, apiKey);
+
+    if (!games.length) {
+      throw buildError_('NO_GAMES', 'fetchSeriesGames', `No games found for series ${seriesId}`, { seriesId });
+    }
+
+    const allRows = [];
+    games.forEach(game => {
+      const rows = processSingleGame_(seriesId, game, seriesInfo, apiKey);
+      allRows.push(...rows);
+    });
+
+    if (!allRows.length) {
+      throw buildError_('NO_ROWS', 'importGridSeries', `No rows generated for series ${seriesId}`, { seriesId });
+    }
+
+    const inserted = saveRowsToDb_(allRows);
+    refreshDerivedSheets_();
+
+    ss.toast(`Imported ${inserted} rows.`, 'GRID Import', 5);
+    SpreadsheetApp.getUi().alert(`Success.\nSeries ID: ${seriesId}\nRows inserted: ${inserted}`);
+  } catch (err) {
+    handleError_(err);
+  } finally {
+    SpreadsheetApp.flush();
+    lock.releaseLock();
+  }
+}
+
+function importGridSeriesBatch() {
+  const lock = LockService.getScriptLock();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  if (!lock.tryLock(5000)) {
+    SpreadsheetApp.getUi().alert('Another import is already running.');
+    return;
+  }
+
+  try {
+    ensureBaseSheets_();
+
+    const apiKey = getApiKey_();
+    const importerSheet = mustGetSheet_(CONFIG.IMPORTER_SHEET);
+    const lastRow = importerSheet.getLastRow();
+
+    if (lastRow < CONFIG.BATCH_START_ROW) {
+      SpreadsheetApp.getUi().alert('No batch rows found.');
+      return;
+    }
+
+    const values = importerSheet.getRange(
+      CONFIG.BATCH_START_ROW,
+      CONFIG.BATCH_SERIES_COL,
+      lastRow - CONFIG.BATCH_START_ROW + 1,
+      3
+    ).getValues();
+
+    const pending = [];
+    values.forEach((row, i) => {
+      const seriesId = String(row[0] || '').trim();
+      const status = String(row[1] || '').trim().toUpperCase();
+      if (seriesId && (!status || status === 'PENDING' || status === 'ERROR')) {
+        pending.push({
+          rowNumber: CONFIG.BATCH_START_ROW + i,
+          seriesId
+        });
+      }
+    });
+
+    const batch = pending.slice(0, CONFIG.BATCH_SIZE);
+    if (!batch.length) {
+      SpreadsheetApp.getUi().alert('No pending series IDs found.');
+      return;
+    }
+
+    let totalInserted = 0;
+
+    batch.forEach(item => {
+      try {
+        ss.toast(`Importing series ${item.seriesId}...`, 'GRID Batch Import', 3);
+
+        const seriesInfo = fetchSeriesInfo_(item.seriesId, apiKey);
+        const games = fetchSeriesGames_(item.seriesId, apiKey);
+
+        if (!games.length) {
+          importerSheet.getRange(item.rowNumber, CONFIG.BATCH_STATUS_COL).setValue('ERROR');
+          importerSheet.getRange(item.rowNumber, CONFIG.BATCH_MESSAGE_COL).setValue('No games found');
+          return;
+        }
+
+        const allRows = [];
+        games.forEach(game => {
+          const rows = processSingleGame_(item.seriesId, game, seriesInfo, apiKey);
+          allRows.push(...rows);
+        });
+
+        const inserted = saveRowsToDb_(allRows);
+        totalInserted += inserted;
+
+        importerSheet.getRange(item.rowNumber, CONFIG.BATCH_STATUS_COL).setValue('DONE');
+        importerSheet.getRange(item.rowNumber, CONFIG.BATCH_MESSAGE_COL).setValue(`Inserted ${inserted} rows`);
+      } catch (err) {
+        writeLogRow_(err);
+        importerSheet.getRange(item.rowNumber, CONFIG.BATCH_STATUS_COL).setValue('ERROR');
+        importerSheet.getRange(item.rowNumber, CONFIG.BATCH_MESSAGE_COL).setValue(truncate_(err.message, 200));
+      }
+    });
+
+    refreshDerivedSheets_();
+    SpreadsheetApp.getUi().alert(`Batch completed. Rows inserted: ${totalInserted}`);
+  } catch (err) {
+    handleError_(err);
+  } finally {
+    SpreadsheetApp.flush();
+    lock.releaseLock();
+  }
+}
+
+function testGridConnection() {
+  try {
+    const apiKey = getApiKey_();
+    const query = `
+      {
+        titles {
+          id
+          name
+        }
+      }
+    `;
+    const data = postGraphQL_(CONFIG.CENTRAL_DATA_GRAPHQL, query, apiKey, 'testGridConnection');
+    const titles = (data && data.titles) ? data.titles : [];
+    SpreadsheetApp.getUi().alert(`GRID connection OK.\nTitles returned: ${titles.length}`);
+  } catch (err) {
+    handleError_(err);
+  }
+}
+
+function lookupRecentSeries() {
+  try {
+    const apiKey = getApiKey_();
+    const importerSheet = mustGetSheet_(CONFIG.IMPORTER_SHEET);
+    const tournamentId = String(importerSheet.getRange(CONFIG.TOURNAMENT_LOOKUP_CELL).getValue()).trim();
+
+    if (!tournamentId) {
+      throw buildError_(
+        'VALIDATION_ERROR',
+        'lookupRecentSeries',
+        `Write a tournament id in ${CONFIG.IMPORTER_SHEET}!${CONFIG.TOURNAMENT_LOOKUP_CELL}`,
+        {}
+      );
+    }
+
+    const query = `
+      {
+        allSeries(
+          filter: {
+            tournament: {
+              id: { in: [${JSON.stringify(tournamentId)}] }
+              includeChildren: { equals: true }
+            }
+          }
+          orderBy: StartTimeScheduled
+        ) {
+          totalCount
+          edges {
+            node {
+              id
+              startTimeScheduled
+              teams {
+                baseInfo {
+                  name
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const data = postGraphQL_(CONFIG.CENTRAL_DATA_GRAPHQL, query, apiKey, 'lookupRecentSeries');
+    const edges = data?.allSeries?.edges || [];
+
+    if (!edges.length) {
+      SpreadsheetApp.getUi().alert(`No series found for tournament ${tournamentId}.`);
+      return;
+    }
+
+    const preview = edges.slice(0, 10).map(e => {
+      const node = e.node || {};
+      const teams = (node.teams || []).map(t => t?.baseInfo?.name || 'Unknown').join(' vs ');
+      return `${node.id} | ${node.startTimeScheduled || 'N/A'} | ${teams}`;
+    }).join('\n');
+
+    SpreadsheetApp.getUi().alert(`Recent series:\n\n${preview}`);
+  } catch (err) {
+    handleError_(err);
+  }
+}
+
+/* =========================
+ * INPUT / CONFIG
+ * ========================= */
+
+function getApiKey_() {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GRID_KEY');
+  if (!apiKey) {
+    throw buildError_('CONFIG_ERROR', 'getApiKey', 'GRID_KEY not found in Script Properties.', {});
+  }
+  return apiKey;
+}
+
+function getSeriesIdInput_() {
+  const sheet = mustGetSheet_(CONFIG.IMPORTER_SHEET);
+  const value = String(sheet.getRange(CONFIG.SERIES_ID_CELL).getValue()).trim();
+
+  if (!value) {
+    throw buildError_(
+      'VALIDATION_ERROR',
+      'getSeriesIdInput',
+      `No series ID found in ${CONFIG.IMPORTER_SHEET}!${CONFIG.SERIES_ID_CELL}`,
+      {}
+    );
+  }
+
+  return value;
+}
+
+/* =========================
+ * FETCH LAYER
+ * ========================= */
+
+function fetchSeriesInfo_(seriesId, apiKey) {
+  const query = `
+    {
+      series(id: ${seriesId}) {
+        id
+        type
+        tournament {
+          id
+          name
+          nameShortened
+        }
+      }
+    }
+  `;
+
+  const data = postGraphQL_(CONFIG.CENTRAL_DATA_GRAPHQL, query, apiKey, 'fetchSeriesInfo');
+  const series = safeGet_(data, ['series'], {
+    required: true,
+    step: 'fetchSeriesInfo',
+    context: { seriesId, rootKeys: Object.keys(data || {}) }
+  });
+
+  return {
+    series_id: String(seriesId),
+    tournament_id: safeGet_(series, ['tournament', 'id'], { defaultValue: '' }),
+    tournament_name: normalizeTournamentName_(safeGet_(series, ['tournament', 'name'], { defaultValue: '' }))
+  };
+}
+
+function fetchSeriesGames_(seriesId, apiKey) {
+  const query = `
+    {
+      seriesState(id: ${seriesId}) {
+        id
+        games {
+          id
+          sequenceNumber
+          started
+          finished
+        }
+      }
+    }
+  `;
+
+  const data = postGraphQL_(CONFIG.SERIES_STATE_GRAPHQL, query, apiKey, 'fetchSeriesGames');
+  const games = safeGet_(data, ['seriesState', 'games'], {
+    required: true,
+    step: 'fetchSeriesGames',
+    context: { seriesId }
+  });
+
+  if (!Array.isArray(games)) {
+    throw buildError_(
+      'SCHEMA_ERROR',
+      'fetchSeriesGames',
+      'seriesState.games is not an array',
+      { seriesId, receivedType: typeof games }
+    );
+  }
+
+  return games;
+}
+
+function fetchGameSummary_(seriesId, sequenceNumber, apiKey) {
+  return getJson_(
+    `file-download/end-state/riot/series/${seriesId}/games/${sequenceNumber}/summary`,
+    apiKey,
+    'fetchGameSummary',
+    { seriesId, sequenceNumber }
+  );
+}
+
+function fetchGameDetails_(seriesId, sequenceNumber, apiKey) {
+  return getJson_(
+    `file-download/end-state/riot/series/${seriesId}/games/${sequenceNumber}/details`,
+    apiKey,
+    'fetchGameDetails',
+    { seriesId, sequenceNumber }
+  );
+}
+
+function postGraphQL_(endpoint, query, apiKey, step) {
+  const url = `${CONFIG.API_BASE_URL}/${endpoint}`;
+  const payload = JSON.stringify({ query });
+
+  for (let attempt = 1; attempt <= CONFIG.MAX_RETRIES; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(url, {
+        method: 'post',
+        contentType: 'application/json',
+        headers: {
+          'x-api-key': apiKey,
+          'Accept': 'application/json'
+        },
+        payload,
+        muteHttpExceptions: true
+      });
+
+      const status = response.getResponseCode();
+      const body = response.getContentText();
+
+      if (status === 200) {
+        const json = parseJson_(body, step, { endpoint });
+
+        if (json?.errors?.length) {
+          throw buildError_(
+            'GRAPHQL_ERROR',
+            step,
+            json.errors.map(e => e.message).join(' | '),
+            { endpoint, errors: json.errors }
+          );
+        }
+
+        return json.data;
+      }
+
+      if (status === 429 && attempt < CONFIG.MAX_RETRIES) {
+        Utilities.sleep(CONFIG.RETRY_DELAY_MS * attempt);
+        continue;
+      }
+
+      throw buildError_(
+        'HTTP_ERROR',
+        step,
+        `HTTP ${status}: ${truncate_(body, CONFIG.MAX_ERROR_BODY_CHARS)}`,
+        { endpoint, status }
+      );
+    } catch (err) {
+      if (attempt === CONFIG.MAX_RETRIES) throw err;
+      Utilities.sleep(CONFIG.RETRY_DELAY_MS * attempt);
+    }
+  }
+
+  throw buildError_('RETRY_EXHAUSTED', step, 'Maximum retry attempts exceeded.', { endpoint });
+}
+
+function getJson_(endpoint, apiKey, step, context) {
+  const text = getText_(endpoint, apiKey, step, context);
+  return parseJson_(text, step, context);
+}
+
+function getText_(endpoint, apiKey, step, context) {
+  const url = `${CONFIG.API_BASE_URL}/${endpoint}`;
+
+  for (let attempt = 1; attempt <= CONFIG.MAX_RETRIES; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(url, {
+        method: 'get',
+        headers: {
+          'x-api-key': apiKey,
+          'Accept': 'application/json'
+        },
+        muteHttpExceptions: true
+      });
+
+      const status = response.getResponseCode();
+      const body = response.getContentText();
+
+      if (status === 200) return body;
+
+      if (status === 429 && attempt < CONFIG.MAX_RETRIES) {
+        Utilities.sleep(CONFIG.RETRY_DELAY_MS * attempt);
+        continue;
+      }
+
+      throw buildError_(
+        'HTTP_ERROR',
+        step,
+        `HTTP ${status}: ${truncate_(body, CONFIG.MAX_ERROR_BODY_CHARS)}`,
+        Object.assign({}, context, { endpoint, status })
+      );
+    } catch (err) {
+      if (attempt === CONFIG.MAX_RETRIES) throw err;
+      Utilities.sleep(CONFIG.RETRY_DELAY_MS * attempt);
+    }
+  }
+
+  throw buildError_('RETRY_EXHAUSTED', step, 'Maximum retry attempts exceeded.', Object.assign({}, context, { endpoint }));
+}
+
+/* =========================
+ * PARSE LAYER
+ * ========================= */
+
+function processSingleGame_(seriesId, game, seriesInfo, apiKey) {
+  const sequenceNumber = safeGet_(game, ['sequenceNumber'], {
+    required: true,
+    step: 'processSingleGame',
+    context: { seriesId, game }
+  });
+
+  const summary = fetchGameSummary_(seriesId, sequenceNumber, apiKey);
+  const details = fetchGameDetails_(seriesId, sequenceNumber, apiKey);
+
+  return parseLolGameToRows_(seriesId, sequenceNumber, seriesInfo, summary, details);
+}
+
+function parseLolGameToRows_(seriesId, sequenceNumber, seriesInfo, statsFile, timelineFile) {
+  const rows = [];
+  const importedAt = new Date();
+
+  const participants = safeGet_(statsFile, ['participants'], {
+    required: true,
+    step: 'parseLolGameToRows',
+    context: { seriesId, sequenceNumber, statsKeys: Object.keys(statsFile || {}) }
+  });
+
+  const teams = safeGet_(statsFile, ['teams'], {
+    required: true,
+    step: 'parseLolGameToRows',
+    context: { seriesId, sequenceNumber }
+  });
+
+  const frames = safeGet_(timelineFile, ['frames'], {
+    defaultValue: [],
+    step: 'parseLolGameToRows',
+    context: { seriesId, sequenceNumber, timelineKeys: Object.keys(timelineFile || {}) }
+  });
+
+  const teamTotals = {
+    100: createEmptyTeamTotals_(),
+    200: createEmptyTeamTotals_()
+  };
+
+  countTeamTotals_(participants, teamTotals);
+  countTurretPlates_(frames, teamTotals);
+  const firstBloodVictim = detectFirstBloodVictim_(frames);
+  const frameAt10 = getClosestFrameAtOrBefore10_(frames);
+  const goldAt10ByParticipant = extractGoldAt10ByParticipant_(frameAt10);
+
+  const gameDuration = toNumber_(safeGet_(statsFile, ['gameDuration'], { defaultValue: 0 }));
+  const platformGameId = `${safeGet_(statsFile, ['platformId'], { defaultValue: '' })}_${safeGet_(statsFile, ['gameId'], { defaultValue: '' })}`;
+
+  participants.forEach(player => {
+    const teamId = toNumber_(safeGet_(player, ['teamId'], { defaultValue: 0 }));
+    const teamTotal = teamTotals[teamId] || createEmptyTeamTotals_();
+    const split = splitTeamTagAndPlayerNickname_(safeGet_(player, ['riotIdGameName'], { defaultValue: '' }));
+    const participantId = toNumber_(safeGet_(player, ['participantId'], { defaultValue: 0 }));
+    const role = normalizeRole_(safeGet_(player, ['teamPosition'], { defaultValue: '' }));
+    const teamObj = findTeamById_(teams, teamId);
+    const side = normalizeSideFromTeamId_(teamId);
+
+    const goldAt10 = toNumber_(goldAt10ByParticipant[participantId]?.gold);
+    const oppGoldAt10 = getOpponentGoldAt10ByRole_(participants, goldAt10ByParticipant, role, teamId);
+    const goldDiffAt10 = goldAt10 - oppGoldAt10;
+
+    rows.push([
+      importedAt,
+      String(seriesId),
+      sequenceNumber,
+      platformGameId,
+      seriesInfo.tournament_id,
+      seriesInfo.tournament_name,
+      split.playerName,
+      split.teamTag,
+      side,
+      role,
+      safeGet_(player, ['championName'], { defaultValue: '' }),
+      intBool_(safeGet_(player, ['win'], { defaultValue: false })),
+      gameDuration,
+      toNumber_(safeGet_(player, ['kills'], { defaultValue: 0 })),
+      toNumber_(safeGet_(player, ['deaths'], { defaultValue: 0 })),
+      toNumber_(safeGet_(player, ['assists'], { defaultValue: 0 })),
+      safeDivide_(
+        toNumber_(safeGet_(player, ['kills'], { defaultValue: 0 })) +
+        toNumber_(safeGet_(player, ['assists'], { defaultValue: 0 })),
+        Math.max(toNumber_(safeGet_(player, ['deaths'], { defaultValue: 0 })), 1)
+      ),
+      safeDivide_(
+        toNumber_(safeGet_(player, ['kills'], { defaultValue: 0 })) +
+        toNumber_(safeGet_(player, ['assists'], { defaultValue: 0 })),
+        teamTotal.kills
+      ),
+      teamTotal.kills,
+      teamTotal.deaths,
+      intBool_(safeGet_(player, ['firstBloodKill'], { defaultValue: false })),
+      intBool_(safeGet_(player, ['firstBloodAssist'], { defaultValue: false })),
+      participantId === firstBloodVictim ? 1 : 0,
+      safePerMinute_(safeGet_(player, ['totalDamageDealtToChampions'], { defaultValue: 0 }), gameDuration),
+      safeDivide_(safeGet_(player, ['totalDamageDealtToChampions'], { defaultValue: 0 }), teamTotal.damageToChampions),
+      safePerMinute_(safeGet_(player, ['wardsPlaced'], { defaultValue: 0 }), gameDuration),
+      safePerMinute_(safeGet_(player, ['wardsKilled'], { defaultValue: 0 }), gameDuration),
+      toNumber_(safeGet_(player, ['visionWardsBoughtInGame'], { defaultValue: 0 })),
+      toNumber_(safeGet_(player, ['totalMinionsKilled'], { defaultValue: 0 })) +
+        toNumber_(safeGet_(player, ['neutralMinionsKilled'], { defaultValue: 0 })),
+      safePerMinute_(
+        toNumber_(safeGet_(player, ['totalMinionsKilled'], { defaultValue: 0 })) +
+        toNumber_(safeGet_(player, ['neutralMinionsKilled'], { defaultValue: 0 })),
+        gameDuration
+      ),
+      toNumber_(safeGet_(player, ['goldEarned'], { defaultValue: 0 })),
+      safePerMinute_(safeGet_(player, ['goldEarned'], { defaultValue: 0 }), gameDuration),
+      intBool_(safeGet_(teamObj, ['objectives', 'tower', 'first'], { defaultValue: 0 })),
+      toNumber_(safeGet_(teamObj, ['objectives', 'tower', 'kills'], { defaultValue: 0 })),
+      teamTotal.turretPlates,
+      intBool_(safeGet_(teamObj, ['objectives', 'dragon', 'first'], { defaultValue: 0 })),
+      toNumber_(safeGet_(teamObj, ['objectives', 'dragon', 'kills'], { defaultValue: 0 })),
+      intBool_(safeGet_(teamObj, ['objectives', 'riftHerald', 'first'], { defaultValue: 0 })),
+      toNumber_(safeGet_(teamObj, ['objectives', 'riftHerald', 'kills'], { defaultValue: 0 })),
+      toNumber_(safeGet_(teamObj, ['objectives', 'baron', 'kills'], { defaultValue: 0 })),
+      toNumber_(safeGet_(teamObj, ['objectives', 'inhibitor', 'kills'], { defaultValue: 0 })),
+      JSON.stringify(safeGet_(teamObj, ['bans'], { defaultValue: [] })),
+      goldAt10,
+      oppGoldAt10,
+      goldDiffAt10
+    ]);
+  });
+
+  return rows;
+}
+
+function countTeamTotals_(participants, teamTotals) {
+  (participants || []).forEach(player => {
+    const teamId = toNumber_(safeGet_(player, ['teamId'], { defaultValue: 0 }));
+    if (!teamTotals[teamId]) teamTotals[teamId] = createEmptyTeamTotals_();
+
+    teamTotals[teamId].kills += toNumber_(safeGet_(player, ['kills'], { defaultValue: 0 }));
+    teamTotals[teamId].deaths += toNumber_(safeGet_(player, ['deaths'], { defaultValue: 0 }));
+    teamTotals[teamId].damageToChampions += toNumber_(safeGet_(player, ['totalDamageDealtToChampions'], { defaultValue: 0 }));
+    teamTotals[teamId].goldEarned += toNumber_(safeGet_(player, ['goldEarned'], { defaultValue: 0 }));
+    teamTotals[teamId].creepScore +=
+      toNumber_(safeGet_(player, ['totalMinionsKilled'], { defaultValue: 0 })) +
+      toNumber_(safeGet_(player, ['neutralMinionsKilled'], { defaultValue: 0 }));
+    teamTotals[teamId].wardsPlaced += toNumber_(safeGet_(player, ['wardsPlaced'], { defaultValue: 0 }));
+    teamTotals[teamId].wardsKilled += toNumber_(safeGet_(player, ['wardsKilled'], { defaultValue: 0 }));
+    teamTotals[teamId].controlWardsPurchased += toNumber_(safeGet_(player, ['visionWardsBoughtInGame'], { defaultValue: 0 }));
+  });
+}
+
+function countTurretPlates_(frames, teamTotals) {
+  (frames || []).forEach(frame => {
+    if (toNumber_(frame?.timestamp) > 850000) return;
+    (frame?.events || []).forEach(event => {
+      if (event?.type === 'TURRET_PLATE_DESTROYED') {
+        let awardedTeamId = null;
+        if (event?.teamId === 200) awardedTeamId = 100;
+        if (event?.teamId === 100) awardedTeamId = 200;
+        if (awardedTeamId && teamTotals[awardedTeamId]) {
+          teamTotals[awardedTeamId].turretPlates += 1;
+        }
+      }
+    });
+  });
+}
+
+function detectFirstBloodVictim_(frames) {
+  let victimId = null;
+  let found = false;
+
+  (frames || []).some(frame => {
+    if (toNumber_(frame?.timestamp) > 850000) return true;
+    return (frame?.events || []).some(event => {
+      if (event?.type === 'CHAMPION_KILL' && !found && toNumber_(event?.killerId) !== 0) {
+        found = true;
+        victimId = event?.victimId || null;
+        return true;
+      }
+      return false;
+    });
+  });
+
+  return victimId;
+}
+
+function getClosestFrameAtOrBefore10_(frames) {
+  const target = 600000;
+  let bestFrame = null;
+
+  (frames || []).forEach(frame => {
+    const ts = toNumber_(frame?.timestamp);
+    if (ts <= target) {
+      if (!bestFrame || ts > toNumber_(bestFrame.timestamp)) {
+        bestFrame = frame;
+      }
+    }
+  });
+
+  if (!bestFrame && frames && frames.length) bestFrame = frames[0];
+  return bestFrame || {};
+}
+
+function extractGoldAt10ByParticipant_(frame) {
+  const out = {};
+  const participantFrames = safeGet_(frame, ['participantFrames'], { defaultValue: {} });
+
+  Object.keys(participantFrames).forEach(pid => {
+    const pf = participantFrames[pid] || {};
+    out[toNumber_(pid)] = {
+      gold: toNumber_(pf?.totalGold)
+    };
+  });
+
+  return out;
+}
+
+function getOpponentGoldAt10ByRole_(participants, goldAt10ByParticipant, role, teamId) {
+  const opponent = (participants || []).find(p =>
+    normalizeRole_(safeGet_(p, ['teamPosition'], { defaultValue: '' })) === String(role || '') &&
+    toNumber_(safeGet_(p, ['teamId'], { defaultValue: 0 })) !== toNumber_(teamId)
+  );
+
+  if (!opponent) return 0;
+
+  const oppParticipantId = toNumber_(safeGet_(opponent, ['participantId'], { defaultValue: 0 }));
+  return toNumber_(goldAt10ByParticipant[oppParticipantId]?.gold);
+}
+
+function createEmptyTeamTotals_() {
+  return {
+    kills: 0,
+    deaths: 0,
+    damageToChampions: 0,
+    goldEarned: 0,
+    creepScore: 0,
+    wardsPlaced: 0,
+    wardsKilled: 0,
+    controlWardsPurchased: 0,
+    turretPlates: 0
+  };
+}
+
+/* =========================
+ * SAVE LAYER
+ * ========================= */
+
+function saveRowsToDb_(rows) {
+  const sheet = mustGetSheet_(CONFIG.DB_SHEET);
+  ensureHeaders_(sheet, CONFIG.DB_HEADERS);
+
+  const dedupedRows = removeDuplicateRowsAgainstSheet_(sheet, rows);
+  if (!dedupedRows.length) return 0;
+
+  for (let i = 0; i < dedupedRows.length; i += CONFIG.WRITE_CHUNK_SIZE) {
+    const chunk = dedupedRows.slice(i, i + CONFIG.WRITE_CHUNK_SIZE);
+    const startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, 1, chunk.length, chunk[0].length).setValues(chunk);
+  }
+
+  return dedupedRows.length;
+}
+
+function removeDuplicateRowsAgainstSheet_(sheet, newRows) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return newRows;
+
+  const existing = sheet.getRange(2, 1, lastRow - 1, CONFIG.DB_HEADERS.length).getValues();
+  const existingKeys = new Set(existing.map(r => buildRowKey_(r)));
+
+  return newRows.filter(row => !existingKeys.has(buildRowKey_(row)));
+}
+
+function buildRowKey_(row) {
+  return [
+    row[1],
+    row[2],
+    row[6],
+    row[10]
+  ].map(v => String(v || '').trim().toLowerCase()).join('__');
+}
+
+/* =========================
+ * ROLE LOGIC
+ * ========================= */
+
+function buildRoleCountMapFromDb_(rows) {
+  const counts = {};
+
+  rows.forEach(r => {
+    const player = String(r[6] || '').trim();
+    const role = normalizeRole_(r[9]);
+
+    if (!player || !role) return;
+    if (!counts[player]) counts[player] = {};
+    counts[player][role] = (counts[player][role] || 0) + 1;
+  });
+
+  return counts;
+}
+
+function buildPrimaryRoleMapFromDb_(rows) {
+  const counts = buildRoleCountMapFromDb_(rows);
+  const out = {};
+
+  Object.keys(counts).forEach(player => {
+    const sorted = Object.entries(counts[player]).sort((a, b) => b[1] - a[1]);
+    out[player] = sorted.length ? sorted[0][0] : 'UNKNOWN';
+  });
+
+  return out;
+}
+
+function buildRoleChipMapFromDb_(rows) {
+  const counts = buildRoleCountMapFromDb_(rows);
+  const out = {};
+
+  Object.keys(counts).forEach(player => {
+    out[player] = Object.entries(counts[player])
+      .sort((a, b) => b[1] - a[1])
+      .map(([role, n]) => `${role} (${n})`)
+      .join(' | ');
+  });
+
+  return out;
+}
+
+function writeRoleMappingSheet_(rows) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = getOrCreateSheet_(ss, CONFIG.ROLE_MAP_SHEET);
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, CONFIG.ROLE_MAP_HEADERS.length).setValues([CONFIG.ROLE_MAP_HEADERS]);
+
+  const primaryRoleMap = buildPrimaryRoleMapFromDb_(rows);
+  const roleChipMap = buildRoleChipMapFromDb_(rows);
+  const roleCountMap = buildRoleCountMapFromDb_(rows);
+
+  const output = Object.keys(primaryRoleMap)
+    .sort()
+    .map(player => [
+      player,
+      primaryRoleMap[player],
+      roleChipMap[player] || '',
+      JSON.stringify(roleCountMap[player] || {})
+    ]);
+
+  if (output.length) {
+    sheet.getRange(2, 1, output.length, output[0].length).setValues(output);
+  }
+}
+
+/* =========================
+ * DERIVED SHEETS
+ * ========================= */
+
+function refreshDerivedSheets_() {
+  updateGeneralStatsSheet_();
+  updateGoldDiffAt10Sheet_();
+}
+
+function updateGeneralStatsSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dbSheet = mustGetSheet_(CONFIG.DB_SHEET);
+  const generalSheet = getOrCreateSheet_(ss, CONFIG.GENERAL_STATS_SHEET);
+
+  generalSheet.clearContents();
+
+  const lastRow = dbSheet.getLastRow();
+  if (lastRow < 2) {
+    generalSheet.getRange(1, 1).setValue('No data available.');
+    return;
+  }
+
+  const data = dbSheet.getRange(2, 1, lastRow - 1, dbSheet.getLastColumn()).getValues();
+  const seriesMap = new Map();
+
+  data.forEach(r => {
+    const seriesId = String(r[1] || '').trim();
+    const player = String(r[6] || '').trim();
+    if (!seriesId || !player) return;
+
+    if (!seriesMap.has(seriesId)) {
+      seriesMap.set(seriesId, []);
+    }
+    seriesMap.get(seriesId).push(r);
+  });
+
+  const output = [];
+
+  Array.from(seriesMap.entries()).forEach(([seriesId, rows]) => {
+    const primaryRoleMap = buildPrimaryRoleMapFromDb_(rows);
+    const roleChipMap = buildRoleChipMapFromDb_(rows);
+
+    const generalAgg = new Map();
+    const roleAgg = new Map();
+
+    rows.forEach(r => {
+      const player = String(r[6] || '').trim();
+      const realRole = normalizeRole_(r[9]);
+      const primaryRole = primaryRoleMap[player] || 'UNKNOWN';
+
+      const generalKey = player;
+      if (!generalAgg.has(generalKey)) {
+        generalAgg.set(generalKey, {
+          player,
+          role: primaryRole,
+          games: 0,
+          wins: 0,
+          kills: 0,
+          deaths: 0,
+          assists: 0,
+          kp: 0,
+          dpm: 0,
+          cspm: 0
+        });
+      }
+
+      const g = generalAgg.get(generalKey);
+      g.games += 1;
+      g.wins += toNumber_(r[11]);
+      g.kills += toNumber_(r[13]);
+      g.deaths += toNumber_(r[14]);
+      g.assists += toNumber_(r[15]);
+      g.kp += toNumber_(r[17]);
+      g.dpm += toNumber_(r[23]);
+      g.cspm += toNumber_(r[29]);
+
+      if (realRole === primaryRole) {
+        const roleKey = `${primaryRole}__${player}`;
+        if (!roleAgg.has(roleKey)) {
+          roleAgg.set(roleKey, {
+            player,
+            role: primaryRole,
+            games: 0,
+            wins: 0,
+            kills: 0,
+            deaths: 0,
+            assists: 0,
+            kp: 0,
+            dpm: 0,
+            cspm: 0
+          });
+        }
+
+        const rr = roleAgg.get(roleKey);
+        rr.games += 1;
+        rr.wins += toNumber_(r[11]);
+        rr.kills += toNumber_(r[13]);
+        rr.deaths += toNumber_(r[14]);
+        rr.assists += toNumber_(r[15]);
+        rr.kp += toNumber_(r[17]);
+        rr.dpm += toNumber_(r[23]);
+        rr.cspm += toNumber_(r[29]);
+      }
+    });
+
+    output.push([`SERIES ${seriesId}`, '', '', '', '', '', '', '', '', '', '', '', '', '', '']);
+    output.push(CONFIG.GENERAL_STATS_HEADERS);
+
+    Array.from(generalAgg.values())
+      .map(rec => {
+        const avgDeaths = safeDivide_(rec.deaths, rec.games);
+        const avgKills = safeDivide_(rec.kills, rec.games);
+        const avgAssists = safeDivide_(rec.assists, rec.games);
+        const avgKda = avgDeaths === 0 ? (avgKills + avgAssists) : ((avgKills + avgAssists) / avgDeaths);
+
+        return [
+          'GENERAL',
+          rec.role,
+          rec.role,
+          roleChipMap[rec.player] || '',
+          rec.player,
+          rec.games,
+          rec.wins,
+          safeDivide_(rec.wins, rec.games),
+          avgKills,
+          avgDeaths,
+          avgAssists,
+          avgKda,
+          safeDivide_(rec.kp, rec.games),
+          safeDivide_(rec.dpm, rec.games),
+          safeDivide_(rec.cspm, rec.games)
+        ];
+      })
+      .sort((a, b) => String(a[1]).localeCompare(String(b[1])) || String(a[4]).localeCompare(String(b[4])))
+      .forEach(row => output.push(row));
+
+    Array.from(roleAgg.values())
+      .map(rec => {
+        const avgDeaths = safeDivide_(rec.deaths, rec.games);
+        const avgKills = safeDivide_(rec.kills, rec.games);
+        const avgAssists = safeDivide_(rec.assists, rec.games);
+        const avgKda = avgDeaths === 0 ? (avgKills + avgAssists) : ((avgKills + avgAssists) / avgDeaths);
+
+        return [
+          'ROLE',
+          rec.role,
+          rec.role,
+          roleChipMap[rec.player] || '',
+          rec.player,
+          rec.games,
+          rec.wins,
+          safeDivide_(rec.wins, rec.games),
+          avgKills,
+          avgDeaths,
+          avgAssists,
+          avgKda,
+          safeDivide_(rec.kp, rec.games),
+          safeDivide_(rec.dpm, rec.games),
+          safeDivide_(rec.cspm, rec.games)
+        ];
+      })
+      .sort((a, b) => String(a[1]).localeCompare(String(b[1])) || String(a[4]).localeCompare(String(b[4])))
+      .forEach(row => output.push(row));
+
+    output.push(['', '', '', '', '', '', '', '', '', '', '', '', '', '', '']);
+  });
+
+  if (output.length) {
+    generalSheet.getRange(1, 1, output.length, output[0].length).setValues(output);
+  }
+
+  writeRoleMappingSheet_(data);
+}
+
+function updateGoldDiffAt10Sheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dbSheet = mustGetSheet_(CONFIG.DB_SHEET);
+  const goldSheet = getOrCreateSheet_(ss, CONFIG.GOLD_DIFF_SHEET);
+
+  goldSheet.clearContents();
+
+  const lastRow = dbSheet.getLastRow();
+  if (lastRow < 2) {
+    goldSheet.getRange(1, 1).setValue('No data available.');
+    return;
+  }
+
+  const data = dbSheet.getRange(2, 1, lastRow - 1, dbSheet.getLastColumn()).getValues();
+  const seriesMap = new Map();
+
+  data.forEach(r => {
+    const seriesId = String(r[1] || '').trim();
+    const player = String(r[6] || '').trim();
+    if (!seriesId || !player) return;
+
+    if (!seriesMap.has(seriesId)) {
+      seriesMap.set(seriesId, []);
+    }
+    seriesMap.get(seriesId).push(r);
+  });
+
+  const output = [];
+
+  Array.from(seriesMap.entries()).forEach(([seriesId, rows]) => {
+    const primaryRoleMap = buildPrimaryRoleMapFromDb_(rows);
+    const roleChipMap = buildRoleChipMapFromDb_(rows);
+
+    const generalAgg = new Map();
+    const roleAgg = new Map();
+
+    rows.forEach(r => {
+      const player = String(r[6] || '').trim();
+      const realRole = normalizeRole_(r[9]);
+      const primaryRole = primaryRoleMap[player] || 'UNKNOWN';
+      const goldAt10 = toNumber_(r[42]);
+      const oppGoldAt10 = toNumber_(r[43]);
+      const goldDiffAt10 = toNumber_(r[44]);
+
+      const generalKey = player;
+      if (!generalAgg.has(generalKey)) {
+        generalAgg.set(generalKey, {
+          player,
+          role: primaryRole,
+          games: 0,
+          goldAt10: 0,
+          oppGoldAt10: 0,
+          goldDiffAt10: 0
+        });
+      }
+
+      const g = generalAgg.get(generalKey);
+      g.games += 1;
+      g.goldAt10 += goldAt10;
+      g.oppGoldAt10 += oppGoldAt10;
+      g.goldDiffAt10 += goldDiffAt10;
+
+      if (realRole === primaryRole) {
+        const roleKey = `${primaryRole}__${player}`;
+        if (!roleAgg.has(roleKey)) {
+          roleAgg.set(roleKey, {
+            player,
+            role: primaryRole,
+            games: 0,
+            goldAt10: 0,
+            oppGoldAt10: 0,
+            goldDiffAt10: 0
+          });
+        }
+
+        const rr = roleAgg.get(roleKey);
+        rr.games += 1;
+        rr.goldAt10 += goldAt10;
+        rr.oppGoldAt10 += oppGoldAt10;
+        rr.goldDiffAt10 += goldDiffAt10;
+      }
+    });
+
+    output.push([`SERIES ${seriesId}`, '', '', '', '', '', '', '', '']);
+    output.push(CONFIG.GOLD_DIFF_HEADERS);
+
+    Array.from(generalAgg.values())
+      .map(rec => [
+        'GENERAL',
+        rec.role,
+        rec.role,
+        roleChipMap[rec.player] || '',
+        rec.player,
+        rec.games,
+        safeDivide_(rec.goldAt10, rec.games),
+        safeDivide_(rec.oppGoldAt10, rec.games),
+        safeDivide_(rec.goldDiffAt10, rec.games)
+      ])
+      .sort((a, b) => String(a[1]).localeCompare(String(b[1])) || String(a[4]).localeCompare(String(b[4])))
+      .forEach(row => output.push(row));
+
+    Array.from(roleAgg.values())
+      .map(rec => [
+        'ROLE',
+        rec.role,
+        rec.role,
+        roleChipMap[rec.player] || '',
+        rec.player,
+        rec.games,
+        safeDivide_(rec.goldAt10, rec.games),
+        safeDivide_(rec.oppGoldAt10, rec.games),
+        safeDivide_(rec.goldDiffAt10, rec.games)
+      ])
+      .sort((a, b) => String(a[1]).localeCompare(String(b[1])) || String(a[4]).localeCompare(String(b[4])))
+      .forEach(row => output.push(row));
+
+    output.push(['', '', '', '', '', '', '', '', '']);
+  });
+
+  if (output.length) {
+    goldSheet.getRange(1, 1, output.length, output[0].length).setValues(output);
+  }
+}
+
+/* =========================
+ * LEADERBOARD
+ * ========================= */
+
+function updateLeaderboard() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const scrimSheet = mustGetSheet_(CONFIG.SCRIM_SHEET);
+    const settingsSheet = mustGetSheet_(CONFIG.SETTINGS_SHEET);
+    const leaderboardSheet = mustGetSheet_(CONFIG.LEADERBOARD_SHEET);
+
+    const settings = getSettingsMap_(settingsSheet);
+    const pointsPerKill = toNumber_(settings['Points per Kill']);
+
+    const placementPoints = {};
+    Object.keys(settings).forEach(key => {
+      const match = String(key).match(/^Placement\s+(\d+)$/i);
+      if (match) placementPoints[match[1]] = toNumber_(settings[key]);
+    });
+
+    leaderboardSheet.clearContents();
+    leaderboardSheet.getRange(1, 1, 1, CONFIG.LEADERBOARD_HEADERS.length)
+      .setValues([CONFIG.LEADERBOARD_HEADERS]);
+
+    const lastRow = scrimSheet.getLastRow();
+    if (lastRow < 2) {
+      SpreadsheetApp.getUi().alert('Leaderboard updated. No scrim data found.');
+      return;
+    }
+
+    const data = scrimSheet.getRange(2, 1, lastRow - 1, CONFIG.SCRIM_HEADERS.length).getValues();
+    const board = new Map();
+
+    data.forEach(row => {
+      const team = String(row[1] || '').trim();
+      const placement = String(row[2] || '').trim();
+      const kills = toNumber_(row[3]);
+      if (!team) return;
+
+      if (!board.has(team)) {
+        board.set(team, {
+          team,
+          games: 0,
+          wins: 0,
+          top4: 0,
+          totalKills: 0,
+          placementPoints: 0,
+          killPoints: 0,
+          totalPoints: 0
+        });
+      }
+
+      const rec = board.get(team);
+      rec.games += 1;
+      rec.totalKills += kills;
+      rec.killPoints += kills * pointsPerKill;
+      rec.placementPoints += toNumber_(placementPoints[placement] || 0);
+      if (placement === '1') rec.wins += 1;
+      if (['1', '2', '3', '4'].includes(placement)) rec.top4 += 1;
+      rec.totalPoints = rec.placementPoints + rec.killPoints;
+    });
+
+    const output = Array.from(board.values())
+      .sort((a, b) => b.totalPoints - a.totalPoints || b.wins - a.wins || b.totalKills - a.totalKills)
+      .map(r => [r.team, r.games, r.wins, r.top4, r.totalKills, r.placementPoints, r.killPoints, r.totalPoints]);
+
+    if (output.length) {
+      leaderboardSheet.getRange(2, 1, output.length, output[0].length).setValues(output);
+    }
+
+    SpreadsheetApp.getUi().alert('Leaderboard calculated.');
+  } catch (err) {
+    handleError_(err);
+  }
+}
+
+/* =========================
+ * SHEETS / SETUP
+ * ========================= */
+
+function ensureBaseSheets_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ensureHeaders_(getOrCreateSheet_(ss, CONFIG.DB_SHEET), CONFIG.DB_HEADERS);
+  ensureHeaders_(getOrCreateSheet_(ss, CONFIG.GENERAL_STATS_SHEET), CONFIG.GENERAL_STATS_HEADERS);
+  ensureHeaders_(getOrCreateSheet_(ss, CONFIG.GOLD_DIFF_SHEET), CONFIG.GOLD_DIFF_HEADERS);
+  ensureHeaders_(getOrCreateSheet_(ss, CONFIG.ROLE_MAP_SHEET), CONFIG.ROLE_MAP_HEADERS);
+  ensureHeaders_(getOrCreateSheet_(ss, CONFIG.LOG_SHEET), CONFIG.LOG_HEADERS);
+}
+
+function setupImporterSheet_(sheet) {
+  sheet.clearContents();
+  sheet.getRange('A1').setValue('GRID Match Importer');
+  sheet.getRange('A3').setValue('Series ID');
+  sheet.getRange('B3').setValue('');
+  sheet.getRange('A5').setValue('Tournament ID (optional)');
+  sheet.getRange('B5').setValue('');
+  sheet.getRange('A7').setValue('Single import');
+  sheet.getRange('A8').setValue('1) Add Series ID in B3');
+  sheet.getRange('A9').setValue('2) Run Import GRID Series');
+  sheet.getRange('A11:D11').setValues([['Row', 'Series ID Batch', 'Status', 'Message']]);
+  sheet.setFrozenRows(11);
+}
+
+function setupSettingsSheet_(sheet) {
+  sheet.clearContents();
+  sheet.getRange(1, 1, CONFIG.SETTINGS_DEFAULTS.length, CONFIG.SETTINGS_DEFAULTS[0].length)
+    .setValues(CONFIG.SETTINGS_DEFAULTS);
+}
+
+function setupTableSheet_(sheet, headers) {
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.setFrozenRows(1);
+}
+
+function ensureHeaders_(sheet, headers) {
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+  }
+}
+
+function mustGetSheet_(name) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  if (!sheet) {
+    throw buildError_('MISSING_SHEET', 'mustGetSheet', `Sheet not found: ${name}`, { name });
+  }
+  return sheet;
+}
+
+function getOrCreateSheet_(ss, name) {
+  return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+
+function getSettingsMap_(settingsSheet) {
+  const lastRow = settingsSheet.getLastRow();
+  if (lastRow < 2) return {};
+  const values = settingsSheet.getRange(2, 1, lastRow - 1, 2).getValues();
+
+  return values.reduce((acc, row) => {
+    const key = String(row[0] || '').trim();
+    if (key) acc[key] = row[1];
+    return acc;
+  }, {});
+}
+
+/* =========================
+ * SAFE ACCESS / HELPERS
+ * ========================= */
+
+function safeGet_(obj, path, options) {
+  const opts = options || {};
+  let current = obj;
+
+  for (let i = 0; i < path.length; i++) {
+    const key = path[i];
+
+    if (current == null || !(key in current)) {
+      if (opts.required) {
+        throw buildError_(
+          'SCHEMA_ERROR',
+          opts.step || 'safeGet',
+          `Missing JSON path: ${path.join('.')}`,
+          Object.assign({}, opts.context || {}, {
+            missingPath: path.join('.'),
+            traversedUntil: path.slice(0, i).join('.'),
+            availableKeys: current && typeof current === 'object' ? Object.keys(current) : []
+          })
+        );
+      }
+      return opts.defaultValue;
+    }
+
+    current = current[key];
+  }
+
+  return current;
+}
+
+function parseJson_(text, step, context) {
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw buildError_(
+      'JSON_PARSE_ERROR',
+      step,
+      `Invalid JSON: ${e.message}`,
+      Object.assign({}, context || {}, {
+        preview: truncate_(text, CONFIG.MAX_ERROR_BODY_CHARS)
+      })
+    );
+  }
+}
+
+function findTeamById_(teams, teamId) {
+  return (teams || []).find(t => toNumber_(t.teamId) === toNumber_(teamId)) || {};
+}
+
+function splitTeamTagAndPlayerNickname_(summonerName) {
+  let teamTag = '';
+  let playerName = summonerName || '';
+
+  if (summonerName && summonerName.indexOf(' ') !== -1 && summonerName.indexOf(' ') < 5) {
+    const prefix = summonerName.split(' ')[0];
+    if (prefix === prefix.toUpperCase()) {
+      teamTag = prefix;
+      playerName = summonerName.substring(summonerName.indexOf(' ') + 1);
+    }
+  }
+
+  return { teamTag, playerName };
+}
+
+function normalizeRole_(rawRole) {
+  const role = String(rawRole || '').trim().toUpperCase();
+  return ROLE_ALIASES[role] || role || 'UNKNOWN';
+}
+
+function normalizeTournamentName_(name) {
+  return name === 'League of Legends Scrims' ? 'Scrim' : String(name || '').trim();
+}
+
+function normalizeSideFromTeamId_(teamId) {
+  const n = toNumber_(teamId);
+  if (n === 100) return 'BLUE';
+  if (n === 200) return 'RED';
+  return 'UNKNOWN';
+}
+
+function safeDivide_(num, den) {
+  const n = toNumber_(num);
+  const d = toNumber_(den);
+  return d === 0 ? 0 : n / d;
+}
+
+function safePerMinute_(value, durationSeconds) {
+  const minutes = toNumber_(durationSeconds) / 60;
+  return minutes === 0 ? 0 : toNumber_(value) / minutes;
+}
+
+function toNumber_(value) {
+  if (value === null || value === undefined || value === '') return 0;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function intBool_(value) {
+  return value ? 1 : 0;
+}
+
+function truncate_(text, maxLen) {
+  const s = String(text || '');
+  return s.length > maxLen ? s.slice(0, maxLen) + 'â€¦' : s;
+}
+
+/* =========================
+ * ERROR HANDLING / LOGGING
+ * ========================= */
+
+function buildError_(code, step, message, context) {
+  const err = new Error(message);
+  err.name = 'AppError';
+  err.code = code;
+  err.step = step;
+  err.context = context || {};
+  return err;
+}
+
+function handleError_(err) {
+  logStructuredError_(err);
+  writeLogRow_(err);
+
+  const message = `[${err.code || 'ERROR'}] ${err.step || 'unknown'}: ${err.message}`;
+  SpreadsheetApp.getActiveSpreadsheet().toast(message, 'GRID Import', 8);
+  SpreadsheetApp.getUi().alert(message);
+}
+
+function logStructuredError_(err) {
+  const payload = {
+    name: err.name || 'Error',
+    code: err.code || 'UNKNOWN',
+    step: err.step || 'unknown',
+    message: err.message || 'Unknown error',
+    context: err.context || {},
+    stack: err.stack || null,
+    timestamp: new Date().toISOString()
+  };
+
+  console.error(JSON.stringify(payload));
+  Logger.log(JSON.stringify(payload));
+}
+
+function writeLogRow_(err) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = getOrCreateSheet_(ss, CONFIG.LOG_SHEET);
+    ensureHeaders_(sheet, CONFIG.LOG_HEADERS);
+
+    sheet.getRange(sheet.getLastRow() + 1, 1, 1, 6).setValues([[
+      new Date(),
+      'ERROR',
+      err.code || 'UNKNOWN',
+      err.step || 'unknown',
+      err.message || 'Unknown error',
+      JSON.stringify(err.context || {})
+    ]]);
+  } catch (logErr) {
+    Logger.log(`Log write failed: ${logErr.message}`);
+  }
+}
