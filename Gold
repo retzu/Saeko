@@ -1,0 +1,72 @@
+function rebuildGoldDiffChart_() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Gold Diff At 10');
+  if (!sheet) throw new Error('Sheet not found: Gold Diff At 10');
+
+  sheet.getCharts().forEach(chart => sheet.removeChart(chart));
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 3) throw new Error('Not enough data in Gold Diff At 10 sheet.');
+
+  const values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+
+  const headerRowIndex = values.findIndex(r =>
+    String(r[0]).trim() === 'View' &&
+    String(r[4]).trim() === 'Summoner Name'
+  );
+  if (headerRowIndex === -1) throw new Error('Header row not found.');
+
+  const headers = values[headerRowIndex];
+  const idxView = headers.indexOf('View');
+  const idxName = headers.indexOf('Summoner Name');
+  const idxGold10 = headers.indexOf('Avg Gold At 10');
+  const idxOppGold10 = headers.indexOf('Avg Opp Gold At 10');
+  const idxDiff10 = headers.indexOf('Avg Gold Diff At 10');
+
+  if ([idxView, idxName, idxGold10, idxOppGold10, idxDiff10].some(i => i === -1)) {
+    throw new Error('Required columns not found.');
+  }
+
+  const rows = [];
+  for (let i = headerRowIndex + 1; i < values.length; i++) {
+    const row = values[i];
+    const view = String(row[idxView] || '').trim();
+    const name = String(row[idxName] || '').trim();
+    const gold10 = Number(row[idxGold10]);
+    const oppGold10 = Number(row[idxOppGold10]);
+    const diff10 = Number(row[idxDiff10]);
+
+    if (!name) continue;
+    if (view !== 'GENERAL' && view !== 'ROLE') continue;
+    if (![gold10, oppGold10, diff10].every(Number.isFinite)) continue;
+
+    rows.push([gold10, oppGold10, name]);
+  }
+
+  if (!rows.length) throw new Error('No valid rows found to chart.');
+
+  const helperStartCol = 12; // L
+  const helperStartRow = 2;
+
+  sheet.getRange(helperStartRow, helperStartCol, 300, 3).clearContent();
+  sheet.getRange(helperStartRow, helperStartCol, 1, 3).setValues([
+    ['Avg Gold At 10', 'Avg Opp Gold At 10', 'Summoner Name']
+  ]);
+  sheet.getRange(helperStartRow + 1, helperStartCol, rows.length, 3).setValues(rows);
+
+  const range = sheet.getRange(helperStartRow, helperStartCol, rows.length + 1, 3);
+
+  const chart = sheet.newChart()
+    .setChartType(Charts.ChartType.SCATTER)
+    .addRange(range)
+    .setNumHeaders(1)
+    .setPosition(2, 22, 0, 0)
+    .setOption('title', 'Avg Opp Gold At 10 vs Avg Gold At 10')
+    .setOption('hAxis', { title: 'Avg Gold At 10' })
+    .setOption('vAxes', { 0: { title: 'Avg Opp Gold At 10' } })
+    .setOption('legend', { position: 'right' })
+    .setOption('pointSize', 7)
+    .build();
+
+  sheet.insertChart(chart);
+}
